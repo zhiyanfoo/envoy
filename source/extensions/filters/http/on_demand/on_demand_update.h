@@ -30,6 +30,12 @@ public:
   virtual ~DecodeHeadersBehavior() = default;
 
   virtual void decodeHeaders(OnDemandRouteUpdate& filter) PURE;
+
+  // Invoked after an on-demand route config update completed and the route cache was
+  // refreshed. Unlike decodeHeaders(), this must not request another route config update: the
+  // update has already been applied, so a still-missing route (e.g. the virtual host was found
+  // but none of its routes match) has to fall through to the router.
+  virtual void onRouteConfigUpdateCompletion(OnDemandRouteUpdate& filter) PURE;
 };
 
 using DecodeHeadersBehaviorPtr = std::unique_ptr<DecodeHeadersBehavior>;
@@ -68,6 +74,8 @@ public:
   void onClusterDiscoveryCompletion(Upstream::ClusterDiscoveryStatus cluster_status);
   // Do on-demand route discovery if the route is missing.
   OptRef<const Router::Route> handleMissingRoute();
+  // Get the current route without triggering on-demand route discovery.
+  OptRef<const Router::Route> route();
   // Do on-demand cluster discovery if the cluster used by the route
   // is missing.
   void handleOnDemandCds(const Router::Route& route, Upstream::OdCdsApiHandle& odcds,

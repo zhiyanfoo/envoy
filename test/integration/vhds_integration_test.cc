@@ -646,5 +646,105 @@ TEST_P(OnDemandVhdsRecreateStreamRegressionTest,
   cleanupUpstreamAndDownstream();
 }
 
+// VHDS resolves the virtual host (route_exists == true) but none of its routes
+// match the request. ``route_exists`` is computed from virtualHostExists(), not
+// from a route match, so the on_demand filter must not treat a still-missing
+// route as "ask VHDS again": the router has to reply 404.
+class OnDemandVhdsResolvedVhostNoMatchingRouteTest
+    : public OnDemandVhdsRecreateStreamRegressionTest {
+public:
+  // ``vhost.first`` with a single route that the request path does not match.
+  envoy::config::route::v3::VirtualHost buildVirtualHostWithNonMatchingRoute() {
+    return TestUtility::parseYaml<envoy::config::route::v3::VirtualHost>(R"EOF(
+name: my_route/vhost_1
+domains: [vhost.first]
+routes:
+- match: { prefix: "/only-this-prefix" }
+  route: { cluster: "my_service" }
+)EOF");
+  }
+
+  void sendResolvedVhost(const std::string& version) {
+    sendDeltaDiscoveryResponse<envoy::config::route::v3::VirtualHost>(
+        Config::TestTypeUrl::get().VirtualHost, {buildVirtualHostWithNonMatchingRoute()}, {},
+        version, vhds_stream_.get(), {"my_route/vhost.first"});
+    // Wait for the ACK so the update has been applied before we look further.
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost, {}, {},
+                                             vhds_stream_.get()));
+  }
+
+  // Sends a request for an unmatched path on ``vhost.first``, resolves the vhost
+  // through VHDS, and asserts the request ends in a 404 without the filter
+  // re-requesting VHDS for the same alias. With ``partial_body`` the request body
+  // is still in flight (end_stream not seen) when VHDS completes.
+  void runAndExpect404(bool partial_body) {
+    initialize();
+
+    codec_client_ = makeHttpConnection(makeClientConnection(lookupPort("http")));
+    Http::TestRequestHeaderMapImpl request_headers{{":method", partial_body ? "POST" : "GET"},
+                                                   {":path", "/other"},
+                                                   {":scheme", "http"},
+                                                   {":authority", "vhost.first"},
+                                                   {"x-lyft-user-id", "123"}};
+    IntegrationStreamDecoderPtr response;
+    if (partial_body) {
+      auto encoder_decoder = codec_client_->startRequest(request_headers);
+      codec_client_->sendData(encoder_decoder.first, std::string(64, 'a'), /*end_stream=*/false);
+      response = std::move(encoder_decoder.second);
+    } else {
+      response = codec_client_->makeHeaderOnlyRequest(request_headers);
+    }
+
+    EXPECT_TRUE(compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
+                                             {vhdsRequestResourceName("vhost.first")}, {},
+                                             vhds_stream_.get()));
+    sendResolvedVhost("2");
+
+    // Expected: the router finds the vhost, matches no route, and replies 404.
+    if (response->waitForEndStream(std::chrono::seconds(5))) {
+      EXPECT_EQ("404", response->headers().getStatusValue());
+      codec_client_->close();
+      return;
+    }
+
+    // No response. Check whether on_demand is re-requesting VHDS for the alias
+    // it just resolved, answering each re-request to see whether it repeats.
+    int re_requests = 0;
+    for (int round = 0; round < 3; ++round) {
+      if (!compareDeltaDiscoveryRequest(Config::TestTypeUrl::get().VirtualHost,
+                                        {vhdsRequestResourceName("vhost.first")}, {},
+                                        vhds_stream_.get())) {
+        break;
+      }
+      ++re_requests;
+      sendResolvedVhost(std::to_string(3 + round));
+    }
+    ADD_FAILURE() << "no response after VHDS resolved vhost.first; on_demand re-requested VHDS "
+                     "for the already-resolved alias "
+                  << re_requests << " time(s) (stopped counting at 3) instead of returning 404";
+    codec_client_->close();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersionsClientType, OnDemandVhdsResolvedVhostNoMatchingRouteTest,
+                         VHDS_INTEGRATION_PARAMS, vhdsTestParamsToString);
+
+TEST_P(OnDemandVhdsResolvedVhostNoMatchingRouteTest, HeaderOnlyReturns404) {
+  runAndExpect404(/*partial_body=*/false);
+}
+
+TEST_P(OnDemandVhdsResolvedVhostNoMatchingRouteTest, PartialBodyReturns404) {
+  runAndExpect404(/*partial_body=*/true);
+}
+
+// Guard-off baseline: with the body not fully read the legacy path cannot
+// recreate the stream, so it continues decoding and the router 404s. The
+// guard-on path must match it.
+TEST_P(OnDemandVhdsResolvedVhostNoMatchingRouteTest, LegacyPartialBodyReturns404) {
+  config_helper_.addRuntimeOverride("envoy.reloadable_features.on_demand_vhds_no_recreate_stream",
+                                    "false");
+  runAndExpect404(/*partial_body=*/true);
+}
+
 } // namespace
 } // namespace Envoy
