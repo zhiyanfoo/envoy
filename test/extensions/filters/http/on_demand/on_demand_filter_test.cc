@@ -342,6 +342,42 @@ TEST_F(OnDemandFilterTest, NoRecreateStreamVhdsResolutionTriggersOnDemandCds) {
   filter_->onRouteConfigUpdateCompletion(true);
 }
 
+// With the no-recreate VHDS guard on, ``route_exists == true`` only means the
+// virtual host was found. If no route in it matches the request, the filter must
+// continue decoding (so the router replies 404) instead of requesting the same
+// route config update again, which would loop.
+TEST_F(OnDemandFilterTest, NoRecreateStreamVhostFoundButNoRouteMatchContinuesDecoding) {
+  Http::TestRequestHeaderMapImpl headers;
+  EXPECT_CALL(decoder_callbacks_, route()).WillRepeatedly(Return(OptRef<const Router::Route>{}));
+  EXPECT_CALL(decoder_callbacks_.downstream_callbacks_, requestRouteConfigUpdate(_));
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_->decodeHeaders(headers, true));
+
+  EXPECT_CALL(decoder_callbacks_.downstream_callbacks_, refreshRouteConfigSnapshot());
+  EXPECT_CALL(decoder_callbacks_.downstream_callbacks_, clearRouteCache());
+  EXPECT_CALL(decoder_callbacks_.downstream_callbacks_, requestRouteConfigUpdate(_)).Times(0);
+  EXPECT_CALL(decoder_callbacks_, continueDecoding());
+  EXPECT_CALL(decoder_callbacks_, recreateStream(_)).Times(0);
+  filter_->onRouteConfigUpdateCompletion(true);
+}
+
+// Same as above with OnDemandCds configured: no route means no cluster to
+// discover, so neither VHDS nor CDS is requested again.
+TEST_F(OnDemandFilterTest, NoRecreateStreamVhostFoundButNoRouteMatchWithCdsContinuesDecoding) {
+  setupWithCds();
+  Http::TestRequestHeaderMapImpl headers;
+  EXPECT_CALL(decoder_callbacks_, route()).WillRepeatedly(Return(OptRef<const Router::Route>{}));
+  EXPECT_CALL(decoder_callbacks_.downstream_callbacks_, requestRouteConfigUpdate(_));
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, filter_->decodeHeaders(headers, true));
+
+  EXPECT_CALL(decoder_callbacks_.downstream_callbacks_, refreshRouteConfigSnapshot());
+  EXPECT_CALL(decoder_callbacks_.downstream_callbacks_, clearRouteCache());
+  EXPECT_CALL(decoder_callbacks_.downstream_callbacks_, requestRouteConfigUpdate(_)).Times(0);
+  EXPECT_CALL(*odcds_, requestOnDemandClusterDiscovery(_, _, _)).Times(0);
+  EXPECT_CALL(decoder_callbacks_, continueDecoding());
+  EXPECT_CALL(decoder_callbacks_, recreateStream(_)).Times(0);
+  filter_->onRouteConfigUpdateCompletion(true);
+}
+
 // tests onClusterDiscoveryCompletion when a cluster is missing
 TEST_F(OnDemandFilterTest, OnClusterDiscoveryCompletionClusterNotFound) {
   EXPECT_CALL(decoder_callbacks_.downstream_callbacks_, clearRouteCache()).Times(0);

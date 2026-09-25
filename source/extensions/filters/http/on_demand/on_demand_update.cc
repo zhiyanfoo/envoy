@@ -20,6 +20,7 @@ namespace {
 class RdsDecodeHeadersBehavior : public DecodeHeadersBehavior {
 public:
   void decodeHeaders(OnDemandRouteUpdate& filter) override { filter.handleMissingRoute(); }
+  void onRouteConfigUpdateCompletion(OnDemandRouteUpdate&) override {}
 };
 
 class RdsCdsDecodeHeadersBehavior : public DecodeHeadersBehavior {
@@ -29,6 +30,14 @@ public:
 
   void decodeHeaders(OnDemandRouteUpdate& filter) override {
     auto route = filter.handleMissingRoute();
+    if (!route.has_value()) {
+      return;
+    }
+    filter.handleOnDemandCds(route.value(), *odcds_, timeout_);
+  }
+
+  void onRouteConfigUpdateCompletion(OnDemandRouteUpdate& filter) override {
+    auto route = filter.route();
     if (!route.has_value()) {
       return;
     }
@@ -166,6 +175,8 @@ OptRef<const Router::Route> OnDemandRouteUpdate::handleMissingRoute() {
   return callbacks_->route();
 }
 
+OptRef<const Router::Route> OnDemandRouteUpdate::route() { return callbacks_->route(); }
+
 Http::FilterHeadersStatus OnDemandRouteUpdate::decodeHeaders(Http::RequestHeaderMap&,
                                                              bool end_stream) {
   downstream_end_stream_ = end_stream;
@@ -260,13 +271,14 @@ void OnDemandRouteUpdate::onRouteConfigUpdateCompletion(bool route_exists) {
     if (route_exists) {
       callbacks_->downstreamCallbacks()->refreshRouteConfigSnapshot();
       callbacks_->downstreamCallbacks()->clearRouteCache();
-      // Re-run the decode-headers behavior against the freshly-resolved route. When OnDemandCds is
-      // configured and the resolved virtual host targets a not-yet-known cluster, this re-triggers
-      // on-demand CDS (returning StopIteration) -- exactly what the legacy recreateStream() path
+      // When OnDemandCds is configured and the resolved route targets a not-yet-known cluster,
+      // start on-demand CDS (returning StopIteration) -- what the legacy recreateStream() path
       // achieved by re-entering decodeHeaders(), but without restarting the whole filter chain. If
       // discovery is started, onClusterDiscoveryCompletion() resumes the stream, so we must not
-      // continue decoding here.
-      getConfig()->decodeHeadersBehavior().decodeHeaders(*this);
+      // continue decoding here. ``route_exists`` only means the virtual host was found; if no
+      // route in it matches, continue so the router replies 404 rather than requesting the same
+      // virtual host again.
+      getConfig()->decodeHeadersBehavior().onRouteConfigUpdateCompletion(*this);
       if (filter_iteration_state_ == Http::FilterHeadersStatus::StopIteration) {
         return;
       }
