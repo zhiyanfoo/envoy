@@ -16,6 +16,7 @@ envoy_cc_library(
         "//envoy/common:optref_lib",
         "//envoy/stream_info:filter_state_interface",
         "//envoy/upstream:cluster_manager_interface",
+        "//source/common/common:basic_resource_lib",
     ],
 )
 

@@ -17,7 +17,14 @@ namespace Http {
 // handle through discovery and streaming; the ordinary async client owns HTTP routing and retries.
 class OnDemandAsyncClient : public ThreadLocal::ThreadLocalObject {
 public:
-  enum class DiscoveryResult { Available, Missing, Timeout, Cancelled, BufferOverflow };
+  enum class DiscoveryResult {
+    Available,
+    Missing,
+    Timeout,
+    Cancelled,
+    BufferOverflow,
+    PendingOverflow
+  };
   using DiscoveryCallback = std::function<void(DiscoveryResult, std::chrono::milliseconds)>;
   OnDemandAsyncClient(Upstream::ClusterManager& cm, Event::Dispatcher& dispatcher);
   ~OnDemandAsyncClient() override;
@@ -25,6 +32,8 @@ public:
 
   // discovery_context must be non-null and is retained by the request. Pending request bodies
   // exceeding options.buffer_limit_ are discarded without applying downstream backpressure.
+  // If the shared pending budget is full, reports PendingOverflow through discovery_callback
+  // and returns nullptr without invoking callbacks or creating a discovery waiter or timer.
   AsyncClient::OngoingRequest*
   startRequest(const std::string& cluster, RequestHeaderMapPtr&& headers,
                AsyncClient::Callbacks& callbacks, const AsyncClient::RequestOptions& options,

@@ -27,6 +27,7 @@ namespace OnDemand {
  * All on-demand filter stats. Route discovery covers on-demand VHDS and SRDS. @see stats_macros.h
  */
 #define ALL_ON_DEMAND_FILTER_STATS(COUNTER, GAUGE, HISTOGRAM)                                      \
+  COUNTER(pending_overflow)                                                                        \
   COUNTER(route_discovery_requested)                                                               \
   COUNTER(route_discovery_found)                                                                   \
   COUNTER(route_discovery_not_found)                                                               \
@@ -262,6 +263,7 @@ private:
   Http::RouteConfigUpdatedCallbackSharedPtr route_config_updated_callback_;
   Upstream::ClusterDiscoveryCallbackHandlePtr cluster_discovery_handle_;
   Upstream::OdCdsContextSharedPtr primary_discovery_context_;
+  Upstream::OdCdsContext::PendingRequestReservationPtr pending_request_reservation_;
   Envoy::Http::FilterHeadersStatus filter_iteration_state_{Http::FilterHeadersStatus::Continue};
   bool decode_headers_active_{false};
   bool downstream_end_stream_{false};

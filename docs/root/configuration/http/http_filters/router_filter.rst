@@ -498,14 +498,15 @@ statistics in the ``mirror.<stat_prefix>.`` namespace:
   rq_success, Counter, Total mirror requests that received a 2xx response
   rq_failure, Counter, Total mirror requests that received a non-2xx response or failed without a response
   rq_cancelled, Counter, Total started mirror requests cancelled because the primary request was destroyed before the request was fully sent
-  discovery_attempt, Counter, Mirror discovery attempts
+  discovery_attempt, Counter, Mirror discovery attempts including pending-limit rejections
   discovery_pending, Gauge, Mirror requests currently waiting for cluster discovery
   discovery_success, Counter, Total mirror requests whose cluster became available
   discovery_missing, Counter, Total mirror requests whose cluster was reported missing or removed during discovery
   discovery_timeout, Counter, Total mirror requests whose cluster discovery timed out
   discovery_cancelled, Counter, Total mirror requests cancelled while waiting for discovery
   discovery_overflow, Counter, Total mirror requests discarded because the pending body exceeded its buffer limit
-  discovery_time, Histogram, Time spent waiting for discovery in milliseconds
+  discovery_pending_overflow, Counter, Mirrors skipped because the pending-request limit was reached
+  discovery_time, Histogram, Time spent waiting for discovery in milliseconds; zero for pending-limit rejections
 
 The statistics are emitted in the server's root scope and tagged with the policy ``stat_prefix``.
 Policies that use the same ``stat_prefix`` share the same counters, including policies of different
@@ -523,14 +524,15 @@ The ``discovery_*`` statistics apply when :ref:`mirror discovery
 <config_http_filters_on_demand_mirrors>` is enabled. They count individual mirror requests,
 including when requests share the same cluster lookup. ``rq_started`` counts HTTP starts;
 cancellation or buffer overflow during discovery increments ``discovery_cancelled`` or
-``discovery_overflow`` respectively.
+``discovery_overflow`` respectively. Pending-limit rejections increment
+``discovery_pending_overflow`` without counting an HTTP start, HTTP failure or missing cluster.
 
 ``rq_started`` minus ``rq_success``, ``rq_failure`` and ``rq_cancelled`` counts mirror HTTP
 requests still in flight. ``discovery_pending`` counts mirrors that are still waiting for a cluster.
 
 To count selected requests not mirrored because an upstream HTTP filter answered the primary
 request locally, subtract ``rq_no_cluster``, ``rq_started``, ``discovery_pending``,
-``discovery_cancelled`` and ``discovery_overflow`` from ``rq_sampled``.
+``discovery_cancelled``, ``discovery_overflow`` and ``discovery_pending_overflow`` from ``rq_sampled``.
 
 Runtime
 -------
@@ -575,7 +577,11 @@ Buffering
 
 Each pending mirror retains a separate copy of the request, using the router's effective
 :ref:`request body buffer limit <envoy_v3_api_field_config.route.v3.Route.request_body_buffer_limit>`.
-Exceeding the limit discards that mirror and releases its buffered data.
+Exceeding the limit discards that mirror and releases its buffered data and pending-request capacity.
+
+The :ref:`pending-request limit <config_http_filters_on_demand_mirroring>` limits the number of
+waiting mirrors. Excess mirrors are discarded without affecting the primary request. This
+request-count limit does not impose an aggregate byte limit.
 
 Pending mirrors do not apply downstream backpressure. Normal upstream backpressure applies
 after discovery succeeds.

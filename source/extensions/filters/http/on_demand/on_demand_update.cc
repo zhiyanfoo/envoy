@@ -117,7 +117,10 @@ createOdCdsContext(const envoy::extensions::filters::http::on_demand::v3::OnDema
                    Upstream::ClusterManager& cm, ProtobufMessage::ValidationVisitor& visitor) {
   auto odcds = createOdCdsApi(config, cm, visitor);
   RETURN_IF_NOT_OK_REF(odcds.status());
-  return std::make_shared<const Upstream::OdCdsContext>(std::move(*odcds), odCdsTimeout(config));
+  return std::make_shared<const Upstream::OdCdsContext>(
+      std::move(*odcds), odCdsTimeout(config),
+      PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, max_pending_requests,
+                                      Upstream::OdCdsContext::DefaultMaxPendingRequests));
 }
 
 absl::StatusOr<DecodeHeadersBehaviorPtr> createDecodeHeadersBehavior(
@@ -155,7 +158,10 @@ absl::StatusOr<Upstream::OdCdsContextSharedPtr> createMirrorContext(
   auto provider = Http::OnDemandAsyncClientProvider::getOrCreate(cm, context.threadLocal(),
                                                                  context.singletonManager());
   return std::make_shared<const Upstream::OdCdsContext>(
-      std::move(*odcds), odCdsTimeout(*odcds_config), std::move(provider));
+      std::move(*odcds), odCdsTimeout(*odcds_config),
+      PROTOBUF_GET_WRAPPED_OR_DEFAULT(*odcds_config, max_pending_requests,
+                                      Upstream::OdCdsContext::DefaultMaxPendingRequests),
+      std::move(provider));
 }
 
 template <typename ProtoConfig>
@@ -292,7 +298,19 @@ void OnDemandRouteUpdate::handleOnDemandCds(const Router::Route& route,
     return;
   }
   filter_iteration_state_ = Http::FilterHeadersStatus::StopIteration;
+  auto pending_request_reservation = context->tryReservePendingRequestSlot();
+  if (pending_request_reservation == nullptr) {
+    if (auto stats = config_->stats(); stats.has_value()) {
+      stats->pending_overflow_.inc();
+    }
+    callbacks_->streamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::UpstreamOverflow);
+    callbacks_->sendLocalReply(Http::Code::ServiceUnavailable,
+                               "on-demand cluster discovery pending request overflow", nullptr,
+                               std::nullopt, "on_demand_pending_overflow");
+    return;
+  }
   primary_discovery_context_ = context;
+  pending_request_reservation_ = std::move(pending_request_reservation);
   startClusterDiscovery(now(), cluster_name);
   auto callback = std::make_unique<Upstream::ClusterDiscoveryCallback>(
       [this](Upstream::ClusterDiscoveryStatus cluster_status) {
@@ -300,8 +318,8 @@ void OnDemandRouteUpdate::handleOnDemandCds(const Router::Route& route,
       });
   auto handle = context->api().requestOnDemandClusterDiscovery(cluster_name, std::move(callback),
                                                                context->timeout());
-  // A synchronous completion can finish discovery before the API returns its handle.
-  if (primary_discovery_context_ != nullptr) {
+  // A synchronous completion can release admission before the API returns its handle.
+  if (pending_request_reservation_ != nullptr) {
     cluster_discovery_handle_ = std::move(handle);
   }
 }
@@ -341,6 +359,7 @@ void OnDemandRouteUpdate::onDestroy() {
 
 void OnDemandRouteUpdate::releasePendingDiscovery() {
   cluster_discovery_handle_.reset();
+  pending_request_reservation_.reset();
   primary_discovery_context_.reset();
 }
 

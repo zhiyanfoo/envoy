@@ -232,6 +232,9 @@ void ShadowRequestContext::onDiscoveryComplete(Http::OnDemandAsyncClient::Discov
   case DiscoveryResult::BufferOverflow:
     stats_->discovery_overflow_.inc();
     break;
+  case DiscoveryResult::PendingOverflow:
+    stats_->discovery_pending_overflow_.inc();
+    break;
   case DiscoveryResult::Available:
     stats_->discovery_success_.inc();
     stats_->rq_started_.inc();
