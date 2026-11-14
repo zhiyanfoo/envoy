@@ -256,6 +256,7 @@ public:
   COUNTER(discovery_timeout)                                                                       \
   COUNTER(discovery_cancelled)                                                                     \
   COUNTER(discovery_overflow)                                                                      \
+  COUNTER(discovery_pending_overflow)                                                              \
   COUNTER(rq_cancelled)                                                                            \
   COUNTER(rq_failure)                                                                              \
   COUNTER(rq_no_cluster)                                                                           \

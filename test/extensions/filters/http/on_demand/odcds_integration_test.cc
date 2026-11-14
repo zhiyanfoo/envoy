@@ -1174,6 +1174,212 @@ TEST_P(OdCdsMirrorIntegrationTest, BufferLimitDropsOnlyOversizedMirrors) {
   }
 }
 
+class OdCdsPendingLimitIntegrationTest : public OdCdsMirrorIntegrationTest {
+public:
+  void TearDown() override {
+    for (auto& connection : discovered_connections_) {
+      EXPECT_TRUE(connection->close());
+      EXPECT_TRUE(connection->waitForDisconnect());
+    }
+    OdCdsMirrorIntegrationTest::TearDown();
+  }
+
+protected:
+  void initializeWithPendingLimit(bool mirror) {
+    ASSERT_NO_FATAL_FAILURE(initializeWithMirrorDiscoveryDisabled());
+    auto* route = routes_.mutable_virtual_hosts(0)->mutable_routes(0);
+    OdCdsIntegrationHelper::PerRouteConfig config;
+    auto* odcds = mirror ? config.mutable_mirror_odcds()->mutable_config() : config.mutable_odcds();
+    *odcds = OdCdsIntegrationHelper::createOnDemandCdsConfig(
+        OdCdsIntegrationHelper::createAdsOdCdsConfigSource(), 10000);
+    odcds->mutable_max_pending_requests()->set_value(2);
+    if (mirror) {
+      auto* policy = route->mutable_route()->mutable_request_mirror_policies(0);
+      policy->clear_cluster();
+      policy->set_cluster_header("discovery-cluster");
+    } else {
+      route->mutable_route()->clear_request_mirror_policies();
+      route->mutable_route()->set_cluster_header("discovery-cluster");
+      auto* header = route->add_response_headers_to_add()->mutable_header();
+      header->set_key("x-response-flags");
+      header->set_value("%RESPONSE_FLAGS%");
+    }
+    std::ignore =
+        (*route->mutable_typed_per_filter_config())[Extensions::HttpFilters::HttpFilterNames::get()
+                                                        .OnDemand]
+            .PackFrom(config);
+    sendDeltaDiscoveryResponse<envoy::config::route::v3::RouteConfiguration>(
+        Config::TestTypeUrl::get().RouteConfiguration, {routes_}, {}, "2");
+    ASSERT_TRUE(compareRequest(Config::TestTypeUrl::get().RouteConfiguration, {}, {}));
+    test_server_->waitForCounter("http.config_test.rds.mirror_routes.config_reload", Eq(2));
+    for (uint32_t worker = 0; worker < concurrency_; ++worker) {
+      clients_.push_back(makeHttpConnection(makeClientConnection(lookupPort("http"))));
+    }
+    ASSERT_NO_FATAL_FAILURE(expectWorkerConnections());
+  }
+
+  IntegrationStreamDecoderPtr requestPrimary(uint32_t worker, const std::string& cluster) {
+    request_headers_.setCopy(Http::LowerCaseString("discovery-cluster"), cluster);
+    return clients_[worker]->makeRequestWithBody(request_headers_, cluster);
+  }
+
+  void requestMirror(uint32_t worker, const std::string& cluster) {
+    request_headers_.setCopy(Http::LowerCaseString("discovery-cluster"), cluster);
+    ASSERT_NO_FATAL_FAILURE(completePrimary(worker, cluster));
+  }
+
+  void discoverCluster(const std::string& name) {
+    const auto cluster = ConfigHelper::buildStaticCluster(
+        name, fake_upstreams_[mirror_upstream_index_]->localAddress()->ip()->port(),
+        Network::Test::getLoopbackAddressString(ipVersion()));
+    sendDeltaDiscoveryResponse<envoy::config::cluster::v3::Cluster>(
+        Config::TestTypeUrl::get().Cluster, {cluster}, {}, name);
+    // An overflowed request must not have queued another discovery subscription.
+    ASSERT_TRUE(compareRequest(Config::TestTypeUrl::get().Cluster, {}, {}));
+    FakeHttpConnectionPtr connection;
+    ASSERT_TRUE(
+        fake_upstreams_[mirror_upstream_index_]->waitForHttpConnection(*dispatcher_, connection));
+    FakeStreamPtr request;
+    ASSERT_TRUE(connection->waitForNewStream(*dispatcher_, request));
+    ASSERT_TRUE(request->waitForEndStream(*dispatcher_));
+    EXPECT_EQ(name, request->body().toString());
+    discovered_connections_.push_back(std::move(connection));
+    discovered_requests_.push_back(std::move(request));
+  }
+
+  void completeDiscoveredRequests() {
+    for (auto& request : discovered_requests_) {
+      request->encodeHeaders(default_response_headers_, true);
+    }
+    for (const auto* cluster : {"first", "held", "reused"}) {
+      test_server_->waitForCounter(fmt::format("cluster.{}.upstream_rq_completed", cluster), Eq(1));
+      EXPECT_EQ(
+          1, test_server_->counter(fmt::format("cluster.{}.upstream_rq_total", cluster))->value());
+    }
+  }
+
+  std::vector<FakeHttpConnectionPtr> discovered_connections_;
+  std::vector<FakeStreamPtr> discovered_requests_;
+};
+
+INSTANTIATE_TEST_SUITE_P(TwoWorkers, OdCdsPendingLimitIntegrationTest,
+                         testing::Values(std::make_tuple(false, 2u)));
+
+TEST_P(OdCdsPendingLimitIntegrationTest, PrimaryAdmissionRecoversAcrossWorkers) {
+  ASSERT_NO_FATAL_FAILURE(initializeWithPendingLimit(false));
+  auto first = requestPrimary(0, "first");
+  ASSERT_TRUE(compareRequest(Config::TestTypeUrl::get().Cluster, {"first"}, {}));
+  test_server_->waitForGauge("http.config_test.on_demand.cluster_discovery_pending", Eq(1));
+  auto held = requestPrimary(1, "held");
+  ASSERT_TRUE(compareRequest(Config::TestTypeUrl::get().Cluster, {"held"}, {}));
+  test_server_->waitForGauge("http.config_test.on_demand.cluster_discovery_pending", Eq(2));
+
+  // Each worker holds only one request, but together they have filled the shared limit.
+  for (uint32_t worker = 0; worker < concurrency_; ++worker) {
+    auto overflow = requestPrimary(worker, fmt::format("overflow-{}", worker));
+    ASSERT_TRUE(overflow->waitForEndStream());
+    EXPECT_EQ("503", overflow->headers().getStatusValue());
+    EXPECT_EQ("on-demand cluster discovery pending request overflow", overflow->body());
+    const auto flags = overflow->headers().get(Http::LowerCaseString("x-response-flags"));
+    ASSERT_FALSE(flags.empty());
+    EXPECT_EQ("UO", flags[0]->value().getStringView());
+  }
+  EXPECT_FALSE(first->complete());
+  EXPECT_FALSE(held->complete());
+  EXPECT_EQ(2, test_server_->counter("http.config_test.on_demand.pending_overflow")->value());
+  EXPECT_EQ(
+      2, test_server_->counter("http.config_test.on_demand.cluster_discovery_requested")->value());
+  EXPECT_EQ(2,
+            test_server_->gauge("http.config_test.on_demand.cluster_discovery_pending")->value());
+
+  ASSERT_NO_FATAL_FAILURE(discoverCluster("first"));
+  test_server_->waitForGauge("http.config_test.on_demand.cluster_discovery_pending", Eq(1));
+  // Worker 1 reuses worker 0's slot while both original HTTP requests remain active.
+  auto reused = requestPrimary(1, "reused");
+  ASSERT_TRUE(compareRequest(Config::TestTypeUrl::get().Cluster, {"reused"}, {}));
+  test_server_->waitForGauge("http.config_test.on_demand.cluster_discovery_pending", Eq(2));
+  EXPECT_FALSE(first->complete());
+  EXPECT_FALSE(held->complete());
+  EXPECT_FALSE(reused->complete());
+
+  ASSERT_NO_FATAL_FAILURE(discoverCluster("held"));
+  ASSERT_NO_FATAL_FAILURE(discoverCluster("reused"));
+  ASSERT_NO_FATAL_FAILURE(completeDiscoveredRequests());
+  for (auto* response : {first.get(), held.get(), reused.get()}) {
+    ASSERT_TRUE(response->waitForEndStream());
+    EXPECT_EQ("200", response->headers().getStatusValue());
+  }
+  test_server_->waitForGauge("http.config_test.on_demand.cluster_discovery_pending", Eq(0));
+  EXPECT_EQ(
+      3, test_server_->counter("http.config_test.on_demand.cluster_discovery_requested")->value());
+  EXPECT_EQ(
+      3, test_server_->counter("http.config_test.on_demand.cluster_discovery_available")->value());
+  EXPECT_EQ(2, test_server_->counter("http.config_test.on_demand.pending_overflow")->value());
+}
+
+class OdCdsMirrorPendingLimitIntegrationTest : public OdCdsPendingLimitIntegrationTest {};
+
+INSTANTIATE_TEST_SUITE_P(
+    TwoWorkers, OdCdsMirrorPendingLimitIntegrationTest,
+    testing::Combine(testing::Bool(), testing::Values(2u)),
+    [](const testing::TestParamInfo<OdCdsMirrorPendingLimitIntegrationTest::ParamType>& info) {
+      return std::get<0>(info.param) ? "WithStats" : "WithoutStats";
+    });
+
+TEST_P(OdCdsMirrorPendingLimitIntegrationTest, MirrorAdmissionRecoversAcrossWorkers) {
+  ASSERT_NO_FATAL_FAILURE(initializeWithPendingLimit(true));
+  ASSERT_NO_FATAL_FAILURE(requestMirror(0, "first"));
+  ASSERT_TRUE(compareRequest(Config::TestTypeUrl::get().Cluster, {"first"}, {}));
+  if (withStats()) {
+    test_server_->waitForGauge("mirror.test.discovery_pending", Eq(1));
+  }
+  ASSERT_NO_FATAL_FAILURE(requestMirror(1, "held"));
+  ASSERT_TRUE(compareRequest(Config::TestTypeUrl::get().Cluster, {"held"}, {}));
+  if (withStats()) {
+    test_server_->waitForGauge("mirror.test.discovery_pending", Eq(2));
+  }
+
+  for (uint32_t worker = 0; worker < concurrency_; ++worker) {
+    // The new mirror is discarded; its primary still receives a successful response.
+    ASSERT_NO_FATAL_FAILURE(requestMirror(worker, fmt::format("overflow-{}", worker)));
+  }
+  ASSERT_TRUE(fake_upstreams_[mirror_upstream_index_]->assertPendingConnectionsEmpty());
+  if (withStats()) {
+    test_server_->waitForCounter("mirror.test.discovery_pending_overflow", Eq(2));
+    EXPECT_EQ(2, test_server_->gauge("mirror.test.discovery_pending")->value());
+    EXPECT_EQ(0, test_server_->counter("mirror.test.rq_started")->value());
+  }
+
+  ASSERT_NO_FATAL_FAILURE(discoverCluster("first"));
+  if (withStats()) {
+    test_server_->waitForGauge("mirror.test.discovery_pending", Eq(1));
+  }
+  // The configuration stays unchanged, and worker 1 can discover a new cluster using the
+  // slot released on worker 0 before that mirror's HTTP response has completed.
+  ASSERT_NO_FATAL_FAILURE(requestMirror(1, "reused"));
+  ASSERT_TRUE(compareRequest(Config::TestTypeUrl::get().Cluster, {"reused"}, {}));
+  if (withStats()) {
+    test_server_->waitForGauge("mirror.test.discovery_pending", Eq(2));
+  }
+
+  ASSERT_NO_FATAL_FAILURE(discoverCluster("held"));
+  ASSERT_NO_FATAL_FAILURE(discoverCluster("reused"));
+  ASSERT_NO_FATAL_FAILURE(completeDiscoveredRequests());
+  if (withStats()) {
+    test_server_->waitForCounter("mirror.test.rq_success", Eq(3));
+    test_server_->waitForGauge("mirror.test.discovery_pending", Eq(0));
+    EXPECT_EQ(5, test_server_->counter("mirror.test.rq_sampled")->value());
+    EXPECT_EQ(5, test_server_->counter("mirror.test.discovery_attempt")->value());
+    EXPECT_EQ(3, test_server_->counter("mirror.test.discovery_success")->value());
+    EXPECT_EQ(3, test_server_->counter("mirror.test.rq_started")->value());
+    EXPECT_EQ(2, test_server_->counter("mirror.test.discovery_pending_overflow")->value());
+    for (const auto* stat :
+         {"discovery_cancelled", "discovery_overflow", "rq_failure", "rq_cancelled"}) {
+      EXPECT_EQ(0, test_server_->counter(absl::StrCat("mirror.test.", stat))->value());
+    }
+  }
+}
+
 class OdCdsAdsIntegrationTest
     : public AdsIntegrationTestBase,
       public testing::TestWithParam<

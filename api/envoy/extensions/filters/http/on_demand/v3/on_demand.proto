@@ -5,6 +5,7 @@ package envoy.extensions.filters.http.on_demand.v3;
 import "envoy/config/core/v3/config_source.proto";
 
 import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
 
 import "udpa/annotations/status.proto";
 import "udpa/annotations/versioning.proto";
@@ -36,6 +37,21 @@ message OnDemandCds {
 
   // The timeout for on demand cluster lookup. If not set, defaults to 5 seconds.
   google.protobuf.Duration timeout = 3;
+
+  // The maximum number of HTTP requests waiting for cluster discovery. If not
+  // specified, the number is unlimited. A value of zero rejects all requests
+  // that require cluster discovery.
+  //
+  // The limit is shared across workers and cluster names using the same
+  // configuration. Primary and mirrored requests have separate counts, including
+  // when ``inherit_primary`` is enabled.
+  //
+  // Excess primary requests receive HTTP 503 with the ``UO`` response flag.
+  // Excess mirrored requests are discarded without affecting the primary request.
+  //
+  // See :ref:`pending cluster discovery requests
+  // <config_http_filters_on_demand_pending_requests>` for details.
+  google.protobuf.UInt32Value max_pending_requests = 4;
 }
 
 // Configuration for on-demand discovery of mirror clusters. These settings apply to all
@@ -51,8 +67,9 @@ message MirrorOnDemandCds {
     option (validate.required) = true;
 
     // If true, use the ``odcds`` configuration from the same filter configuration for mirror
-    // cluster discovery, including its discovery timeout. If ``odcds`` is not specified, mirror cluster
-    // discovery is disabled.
+    // cluster discovery, including its discovery timeout and pending-request limit. Mirrored
+    // requests have a separate pending-request count from original requests. If ``odcds`` is
+    // not specified, mirror cluster discovery is disabled.
     bool inherit_primary = 1 [(validate.rules).bool = {const: true}];
 
     // Configuration for on-demand discovery of mirror clusters, independent of ``odcds``.

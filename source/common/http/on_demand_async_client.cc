@@ -51,9 +51,11 @@ public:
   Request(OnDemandAsyncClient& parent, std::string cluster, RequestHeaderMapPtr&& headers,
           AsyncClient::Callbacks& callbacks, const AsyncClient::RequestOptions& options,
           const Upstream::OdCdsContextSharedPtr& discovery_context, bool end_stream,
-          DiscoveryCallback discovery_callback)
+          DiscoveryCallback discovery_callback,
+          Upstream::OdCdsContext::PendingRequestReservationPtr pending_request_reservation)
       : parent_(parent), cluster_(std::move(cluster)), headers_(std::move(headers)),
         callbacks_(callbacks), options_(options), discovery_context_(discovery_context),
+        pending_request_reservation_(std::move(pending_request_reservation)),
         discovery_callback_(std::move(discovery_callback)), body_(options.account_),
         stream_info_(parent.dispatcher_.timeSource(), nullptr,
                      StreamInfo::FilterState::LifeSpan::FilterChain),
@@ -350,6 +352,9 @@ private:
       if (timer_ != nullptr) {
         timer_->disableTimer();
       }
+      // Release admission before notifying the caller or starting HTTP. Deferred deletion
+      // must not keep a completed discovery counted against the pending-request limit.
+      pending_request_reservation_.reset();
       const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
           parent_.dispatcher_.timeSource().monotonicTime() - started_at_);
       absl::string_view outcome;
@@ -368,6 +373,11 @@ private:
         break;
       case DiscoveryResult::BufferOverflow:
         outcome = "buffer_overflow";
+        break;
+      case DiscoveryResult::PendingOverflow:
+        // Admission rejects these requests before a Request is allocated.
+        IS_ENVOY_BUG("pending overflow cannot finish an admitted discovery");
+        outcome = "pending_overflow";
         break;
       }
       span_->setTag("discovery.result", outcome);
@@ -413,6 +423,7 @@ private:
   AsyncClient::Callbacks& callbacks_;
   AsyncClient::RequestOptions options_;
   const Upstream::OdCdsContextSharedPtr discovery_context_;
+  Upstream::OdCdsContext::PendingRequestReservationPtr pending_request_reservation_;
   DiscoveryCallback discovery_callback_;
   Buffer::OwnedImpl body_;
   RequestTrailerMapPtr trailers_;
@@ -450,9 +461,14 @@ OnDemandAsyncClient::startRequest(const std::string& cluster, RequestHeaderMapPt
                                   const Upstream::OdCdsContextSharedPtr& discovery_context,
                                   bool end_stream, DiscoveryCallback discovery_callback) {
   ASSERT(discovery_context != nullptr);
-  auto request =
-      std::make_unique<Request>(*this, cluster, std::move(headers), callbacks, options,
-                                discovery_context, end_stream, std::move(discovery_callback));
+  auto pending_request_reservation = discovery_context->tryReservePendingRequestSlot();
+  if (pending_request_reservation == nullptr) {
+    discovery_callback(DiscoveryResult::PendingOverflow, std::chrono::milliseconds(0));
+    return nullptr;
+  }
+  auto request = std::make_unique<Request>(
+      *this, cluster, std::move(headers), callbacks, options, discovery_context, end_stream,
+      std::move(discovery_callback), std::move(pending_request_reservation));
   auto* result = request.get();
   LinkedList::moveIntoList(std::move(request), requests_);
   result->start();

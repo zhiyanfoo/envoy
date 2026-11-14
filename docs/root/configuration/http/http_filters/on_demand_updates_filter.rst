@@ -33,6 +33,28 @@ Configuration
 * :ref:`v3 API reference for per route/virtual host config <envoy_v3_api_msg_extensions.filters.http.on_demand.v3.PerRouteConfig>`
 * The filter should be placed before *envoy.filters.http.router* filter in the HttpConnectionManager's filter chain.
 
+.. _config_http_filters_on_demand_pending_requests:
+
+Pending cluster discovery requests
+----------------------------------
+
+Set :ref:`max_pending_requests
+<envoy_v3_api_field_extensions.filters.http.on_demand.v3.OnDemandCds.max_pending_requests>` to
+limit requests waiting for cluster discovery. The default is unlimited. Zero rejects requests
+that need discovery; requests to available clusters are unaffected.
+
+Excess primary requests receive HTTP 503 with the ``UO`` response flag and
+``on_demand_pending_overflow`` response-code detail.
+
+Each listener or per-route configuration has its own count, shared across workers and cluster
+names. Each waiting request counts, even when several requests need the same cluster.
+Requests stop counting when discovery completes, times out or is cancelled. Active upstream
+requests and route discovery are excluded.
+
+A replacement configuration starts a new count; existing requests use their original count.
+Concurrent admissions can briefly exceed the limit, as with
+:ref:`cluster circuit breakers <arch_overview_circuit_break>`.
+
 .. _config_http_filters_on_demand_mirrors:
 
 On-demand mirror clusters
@@ -50,6 +72,7 @@ To reuse the primary discovery settings, set ``inherit_primary: true``:
   odcds:
     source:
       ads: {}
+    max_pending_requests: 1024
   mirror_odcds:
     inherit_primary: true
 
@@ -71,6 +94,20 @@ For static routes with missing clusters, set :ref:`validate_clusters
 <envoy_v3_api_field_config.route.v3.RouteConfiguration.validate_clusters>` to ``false``
 (the default for RDS). See :ref:`mirror discovery behavior <config_http_filters_router_mirror_odcds>`
 for buffering, timeouts and cancellation.
+
+.. _config_http_filters_on_demand_mirroring:
+
+Pending mirrored requests
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Mirror policies using the same configuration share a count separate from primary requests.
+With ``inherit_primary: true``, mirrors inherit the limit but keep their own count. To set a
+different limit, use ``mirror_odcds.config.max_pending_requests``.
+
+Excess mirrors are discarded without affecting the primary request, incrementing the mirror
+policy's :ref:`discovery_pending_overflow <config_http_filters_router_mirror_stats>` counter.
+Zero discards all mirrors that need discovery. Mirrors remain counted while discovery is
+pending, even after the primary request ends.
 
 Per-route configuration
 -----------------------
@@ -94,14 +131,16 @@ the :ref:`cluster manager statistics <config_cluster_manager_odcds_stats>`.
 
 The filter also emits statistics under the HTTP connection manager's stat prefix, as
 ``http.<stat_prefix>.on_demand.``. They only account for requests that actually had to wait for a
-discovery; a request whose route and cluster are already known does not touch them. Route discovery
-covers on-demand VHDS and on-demand S/RDS, which the filter cannot tell apart. A route discovery
-counts as found when the virtual host (or scoped route configuration) was delivered.
+discovery or were rejected by the pending-request limit. Requests with known routes and clusters
+are not counted. Route discovery covers on-demand VHDS and on-demand S/RDS, which the filter
+cannot tell apart. A route discovery counts as found when the virtual host (or scoped route
+configuration) was delivered.
 
 .. csv-table::
   :header: Name, Type, Description
   :widths: 1, 1, 2
 
+  pending_overflow, Counter, Total primary requests rejected because the pending-request limit was reached.
   route_discovery_requested, Counter, Total on-demand route discoveries started.
   route_discovery_found, Counter, Route discoveries that completed with the route configuration available.
   route_discovery_not_found, Counter, Route discoveries that completed without the route configuration becoming available.
